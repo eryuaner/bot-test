@@ -8,6 +8,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  checks: read
 
 jobs:
   handle-command:
@@ -80,12 +81,33 @@ jobs:
               return;
             }
 
-            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: pr.head.sha,
-            });
-            if (combined.state === 'pending') {
+            async function ciGate() {
+              const { data } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: pr.head.sha,
+                filter: 'latest',
+              });
+              const runs = data.check_runs.filter(
+                (run) => run.name !== 'Handle /lgtm and /approve',
+              );
+              if (runs.length === 0) {
+                return 'pending';
+              }
+              if (runs.some((run) => run.status !== 'completed')) {
+                return 'pending';
+              }
+              const bad = runs.some(
+                (run) =>
+                  run.conclusion !== 'success' &&
+                  run.conclusion !== 'skipped' &&
+                  run.conclusion !== 'neutral',
+              );
+              return bad ? 'failure' : 'success';
+            }
+
+            const ciState = await ciGate();
+            if (ciState === 'pending') {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -94,7 +116,7 @@ jobs:
               });
               return;
             }
-            if (combined.state === 'failure') {
+            if (ciState === 'failure') {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
