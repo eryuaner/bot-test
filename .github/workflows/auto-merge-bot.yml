@@ -1,0 +1,128 @@
+name: Auto merge bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  handle-command:
+    if: github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /lgtm and /approve
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        with:
+          script: |
+            const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            if (!allowed.includes(process.env.AUTHOR_ASSOCIATION)) {
+              core.info('Comment author is not a maintainer; ignoring.');
+              return;
+            }
+
+            const body = (process.env.COMMENT_BODY || '').trim();
+            const isLgtm = /^\/lgtm\b/i.test(body);
+            const isApprove = /^\/approve\b/i.test(body);
+            if (!isLgtm && !isApprove) {
+              return;
+            }
+
+            const prNumber = context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.state !== 'open') {
+              core.info('PR is not open.');
+              return;
+            }
+
+            const lgtmLabel = 'lgtm';
+            const approvedLabel = 'approved';
+
+            if (isLgtm) {
+              const labels = pr.labels.map((l) => l.name);
+              if (!labels.includes(lgtmLabel)) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [lgtmLabel],
+                });
+              }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${process.env.COMMENT_USER} 已记录 \`/lgtm\`。维护者在 PR 上评论 \`/approve\` 且 CI 通过后将自动合入。`,
+              });
+              return;
+            }
+
+            const labels = pr.labels.map((l) => l.name);
+            if (!labels.includes(lgtmLabel)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${process.env.COMMENT_USER} 合入前需要至少一条 maintainer 的 \`/lgtm\` 评论（或已有 \`lgtm\` 标签）。`,
+              });
+              return;
+            }
+
+            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha,
+            });
+            if (combined.state === 'pending') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${process.env.COMMENT_USER} CI 仍在运行，请通过后再 \`/approve\`。`,
+              });
+              return;
+            }
+            if (combined.state === 'failure') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${process.env.COMMENT_USER} CI 未通过，无法自动合入。`,
+              });
+              return;
+            }
+
+            if (!labels.includes(approvedLabel)) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [approvedLabel],
+              });
+            }
+
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              merge_method: 'merge',
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `Pull Request 已由自动合并 bot 合入（触发人 @${process.env.COMMENT_USER}，\`/approve\`）。`,
+            });
